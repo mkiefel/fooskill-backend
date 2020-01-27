@@ -435,28 +435,28 @@ impl Store {
     /// # Arguments
     ///
     /// * `group_id` ID of the group.
-    /// * `after_game_id` start listing games after this optional game ID.
+    /// * `before_game_id` start listing games before this optional game ID.
     pub fn list_games(
         &mut self,
         group_id: &GroupId,
-        after_game_id: &Option<GameId>,
+        before_game_id: &Option<GameId>,
     ) -> Result<Vec<Game>, Error> {
         let games_key = Self::games_key(group_id);
         let game_ids = commit(self.con(), |con, _pipe| -> Result<Vec<GameId>, Error> {
-            let after_game_rank = after_game_id
+            let before_game_rank = before_game_id
                 .as_ref()
                 .map(|game_id| -> Result<isize, Error> {
                     let (rank,): (isize,) = redis::pipe()
                         .cmd("WATCH")
                         .arg(&games_key)
                         .ignore()
-                        .zrank(&games_key, game_id)
+                        .zrevrank(&games_key, game_id)
                         .query(con)?;
                     Ok(rank + 1)
                 })
                 .unwrap_or(Ok(0))?;
 
-            con.zrange(Self::games_key(group_id), after_game_rank, 100)
+            con.zrevrange(Self::games_key(group_id), before_game_rank, 100)
                 .map_err(|err| err.into())
         })?;
         // Games never will be deleted, so there is no race here.

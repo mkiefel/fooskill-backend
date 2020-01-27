@@ -34,17 +34,17 @@ pub struct GetGamesResponse {
     games: Vec<Game>,
 }
 
-#[get("/<secret_group_id>/games?<after>")]
+#[get("/<secret_group_id>/games?<before>")]
 pub fn get_games(
     mut store: Store,
     group_key: rocket::State<GroupKey>,
     secret_group_id: String,
-    after: Option<GameId>,
+    before: Option<GameId>,
 ) -> Result<Json<GetGamesResponse>, Error> {
     let group_id =
         decode_and_validate_group_id(&group_key, secret_group_id)?;
     store
-        .list_games(&group_id, &after)
+        .list_games(&group_id, &before)
         .map(|games| Json(GetGamesResponse { games }))
 }
 
