@@ -1,7 +1,19 @@
 use rocket_contrib::json::Json;
 
-use crate::store::{Error, Game, GameId, Store, User, UserId, GroupKey, decode_and_validate_group_id};
+use crate::store::{
+    decode_and_validate_group_id, Error, Game, GameId, GroupKey, Store, User, UserId,
+};
 
+impl<'a> rocket::request::FromFormValue<'a> for GameId {
+    type Error = &'a rocket::http::RawStr;
+
+    fn from_form_value(form_value: &'a rocket::http::RawStr) -> Result<Self, Self::Error> {
+        form_value
+            .url_decode()
+            .map(Into::<GameId>::into)
+            .map_err(|_| form_value)
+    }
+}
 
 #[derive(Deserialize, Debug)]
 pub struct PostGameRequest {
@@ -21,13 +33,11 @@ pub fn post_game(
     secret_group_id: String,
     request: Json<PostGameRequest>,
 ) -> Result<Json<PostGameResponse>, Error> {
-    let group_id =
-        decode_and_validate_group_id(&group_key, secret_group_id)?;
+    let group_id = decode_and_validate_group_id(&group_key, secret_group_id)?;
     store
         .create_game(&group_id, &request.winner_ids, &request.loser_ids)
         .map(|game| Json(PostGameResponse { game }))
 }
-
 
 #[derive(Serialize, Debug)]
 pub struct GetGamesResponse {
@@ -41,8 +51,7 @@ pub fn get_games(
     secret_group_id: String,
     before: Option<GameId>,
 ) -> Result<Json<GetGamesResponse>, Error> {
-    let group_id =
-        decode_and_validate_group_id(&group_key, secret_group_id)?;
+    let group_id = decode_and_validate_group_id(&group_key, secret_group_id)?;
     store
         .list_games(&group_id, &before)
         .map(|games| Json(GetGamesResponse { games }))
@@ -65,8 +74,7 @@ pub fn post_user(
     secret_group_id: String,
     request: Json<PostUserRequest>,
 ) -> Result<Json<PostUserResponse>, Error> {
-    let group_id =
-        decode_and_validate_group_id(&group_key, secret_group_id)?;
+    let group_id = decode_and_validate_group_id(&group_key, secret_group_id)?;
     store
         .create_user(&group_id, &request.name)
         .map(|user| Json(PostUserResponse { user }))
@@ -84,14 +92,11 @@ pub fn get_user(
     secret_group_id: String,
     user_id: UserId,
 ) -> Result<Json<GetUserResponse>, Error> {
-    let group_id =
-        decode_and_validate_group_id(&group_key, secret_group_id)?;
-    store
-        .read_users(&group_id, &vec![user_id])
-        .map(|mut users| {
-            let user = users.pop().unwrap();
-            Json(GetUserResponse { user })
-        })
+    let group_id = decode_and_validate_group_id(&group_key, secret_group_id)?;
+    store.read_users(&group_id, &[user_id]).map(|mut users| {
+        let user = users.pop().unwrap();
+        Json(GetUserResponse { user })
+    })
 }
 
 #[derive(Serialize, Debug)]
@@ -107,8 +112,7 @@ pub fn query_user(
     secret_group_id: String,
     query: String,
 ) -> Result<Json<QueryUserResponse>, Error> {
-    let group_id =
-        decode_and_validate_group_id(&group_key, secret_group_id)?;
+    let group_id = decode_and_validate_group_id(&group_key, secret_group_id)?;
     store
         .query_user(&group_id, &query)
         .map(|users| Json(QueryUserResponse { query, users }))
@@ -125,8 +129,7 @@ pub fn get_leaderboard(
     group_key: rocket::State<GroupKey>,
     secret_group_id: String,
 ) -> Result<Json<GetLeaderboardResponse>, Error> {
-    let group_id =
-        decode_and_validate_group_id(&group_key, secret_group_id)?;
+    let group_id = decode_and_validate_group_id(&group_key, secret_group_id)?;
     store
         .get_leaderboard(&group_id)
         .map(|users| Json(GetLeaderboardResponse { users }))

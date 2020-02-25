@@ -21,6 +21,17 @@ use rocket_contrib::templates;
 
 use store::Store;
 
+impl<'r> rocket::request::FromParam<'r> for store::UserId {
+    type Error = &'r rocket::http::RawStr;
+
+    fn from_param(param: &'r rocket::http::RawStr) -> Result<Self, Self::Error> {
+        param
+            .percent_decode()
+            .map(|cow| cow.into_owned().into())
+            .map_err(|_| param)
+    }
+}
+
 /// Repesents a game with all players being resolved to their user data.
 #[derive(Serialize, Debug)]
 struct JoinedGame {
@@ -44,7 +55,7 @@ fn user(
     user_id: store::UserId,
 ) -> Result<templates::Template, store::Error> {
     let group_id = store::decode_and_validate_group_id(&group_key, secret_group_id.clone())?;
-    let users = store.read_users(&group_id, &vec![user_id.clone()])?;
+    let users = store.read_users(&group_id, &[user_id.clone()])?;
     let user = users.first().unwrap();
     let games = store.get_recent_games(&group_id, &user_id)?;
     let joined_games = games

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use derive_more::From;
 use redis::{self, Commands, PipelineCommands};
 use rocket::http::Status;
 use rocket::request::Request;
@@ -57,9 +58,39 @@ impl Poolable for Connection {
 #[database("fooskill")]
 pub struct Store(Connection);
 
-pub type GroupId = String;
-pub type GameId = String;
-pub type UserId = String;
+#[derive(Clone)]
+pub struct GroupId(String);
+#[derive(Clone, Debug, From, Serialize, Deserialize)]
+pub struct GameId(String);
+#[derive(Clone, Debug, PartialEq, Eq, From, Serialize, Deserialize, Hash)]
+pub struct UserId(String);
+
+impl redis::FromRedisValue for GameId {
+    fn from_redis_value(v: &redis::Value) -> redis::RedisResult<GameId> {
+        match *v {
+            redis::Value::Data(ref bytes) => Ok(GameId(std::str::from_utf8(bytes)?.to_string())),
+            _ => Err(redis::RedisError::from((
+                redis::ErrorKind::TypeError,
+                "Response was of incompatible type",
+                format!("Response type not compatible. (response was {:?})", v),
+            ))),
+        }
+    }
+}
+
+// TODO(mkiefel): Remove the copied implementation of this newtype.
+impl redis::FromRedisValue for UserId {
+    fn from_redis_value(v: &redis::Value) -> redis::RedisResult<UserId> {
+        match *v {
+            redis::Value::Data(ref bytes) => Ok(UserId(std::str::from_utf8(bytes)?.to_string())),
+            _ => Err(redis::RedisError::from((
+                redis::ErrorKind::TypeError,
+                "Response was of incompatible type",
+                format!("Response type not compatible. (response was {:?})", v),
+            ))),
+        }
+    }
+}
 
 pub struct GroupKey(cookie::Key);
 
@@ -80,7 +111,7 @@ pub fn decode_and_validate_group_id(
     let private = jar.private(&group_key.0);
     private
         .get("group_id")
-        .map(|cookie| cookie.value().to_owned())
+        .map(|cookie| GroupId(cookie.value().to_owned()))
         .ok_or(Error::InvalidGroupId)
 }
 
@@ -169,7 +200,7 @@ impl<T: serde::de::DeserializeOwned> redis::FromRedisValue for RedisJson<T> {
     fn from_redis_value(v: &redis::Value) -> redis::RedisResult<RedisJson<T>> {
         match *v {
             redis::Value::Data(ref bytes) => serde_json::from_slice::<T>(bytes)
-                .map(|value| RedisJson(value))
+                .map(RedisJson)
                 .map_err(|error| {
                     redis::RedisError::from((
                         redis::ErrorKind::TypeError,
@@ -218,6 +249,7 @@ where
     C: redis::ConnectionLike,
 {
     con: &'a mut C,
+    group_id: GroupId,
     cache: HashMap<UserId, merge::Mergeable<UserId, VersionedUser>>,
 }
 
@@ -227,7 +259,7 @@ where
 {
     fn append(&self, pipe: &mut redis::Pipeline) {
         for (k, v) in self.cache.iter() {
-            pipe.set(k, RedisJson(v));
+            pipe.set(Store::user_key(&self.group_id, &k), RedisJson(v));
         }
     }
 }
@@ -249,12 +281,10 @@ where
         }
         // Up to this point we have never encountered this node, let's fetch it
         // then from the store.
-        redis::cmd("WATCH")
-            .arg(index.clone())
-            .query(self.con)
-            .ok()?;
+        let user_key = Store::user_key(&self.group_id, index);
+        redis::cmd("WATCH").arg(&user_key).query(self.con).ok()?;
         self.con
-            .get(index.clone())
+            .get(&user_key)
             .map(
                 |RedisJson::<merge::Mergeable<Self::Index, Self::Item>>(node)| {
                     // Insert into cache for the next lookup.
@@ -308,9 +338,9 @@ impl Store {
 
         let mut user_ids = Vec::new();
         for entry in entries {
-            let splits = entry.split(":").collect::<Vec<_>>();
+            let splits = entry.split(':').collect::<Vec<_>>();
             if splits.len() >= 2 {
-                user_ids.push(String::from(*splits.last().unwrap()));
+                user_ids.push(UserId(splits.last().unwrap().to_string()));
             }
         }
         Ok(user_ids)
@@ -320,17 +350,18 @@ impl Store {
     pub fn read_users(
         &mut self,
         group_id: &GroupId,
-        user_ids: &Vec<UserId>,
+        user_ids: &[UserId],
     ) -> Result<Vec<User>, Error> {
         commit(self.con(), |con, pipe| {
             let mut ctx = UserStoreCtx {
                 con,
+                group_id: group_id.clone(),
                 cache: HashMap::new(),
             };
             let users = user_ids
                 .iter()
                 .map(|user_id| {
-                    merge::find(Self::user_key(group_id, user_id))
+                    merge::find(user_id.clone())
                         .run(&mut ctx)
                         .map(|user| user.latest())
                 })
@@ -338,7 +369,6 @@ impl Store {
             ctx.append(pipe);
             users
         })
-        .map_err(|err| err.into())
     }
 
     /// Creates a user with the given name.
@@ -346,9 +376,9 @@ impl Store {
         if name.len() < 3 {
             return Err(Error::UserNameTooShort);
         }
-        let user_id = uuid::Uuid::new_v4().simple().to_string();
+        let user_id = UserId(uuid::Uuid::new_v4().simple().to_string());
         let key = Self::user_key(group_id, &user_id);
-        let index_entry = name.to_owned() + ":" + &user_id;
+        let index_entry = name.to_owned() + ":" + &user_id.0;
 
         let user_name_index = Self::user_name_index_key(group_id);
         commit(self.con(), |con, pipe| {
@@ -368,10 +398,11 @@ impl Store {
             let user = User {
                 id: user_id.clone(),
                 name: name.to_owned(),
-                player: crate::true_skill::Player::new(),
+                player: Default::default(),
             };
+            // TODO(mkiefel): Move this into the merge logic.
             let node: merge::Mergeable<UserId, VersionedUser> =
-                merge::Mergeable::new(key.clone(), VersionedUser::new(user.clone()));
+                merge::Mergeable::new(user_id.clone(), VersionedUser::new(user.clone()));
             pipe.set(&key, RedisJson(&node))
                 .ignore()
                 .zadd(&user_name_index, index_entry.clone(), 0_f32)
@@ -406,7 +437,7 @@ impl Store {
     /// Reads the top 100 users.
     pub fn get_leaderboard(&mut self, group_id: &GroupId) -> Result<Vec<User>, Error> {
         // TODO(mkiefel): Implement some form of pagination for this.
-        let user_ids: Vec<String> =
+        let user_ids: Vec<UserId> =
             self.con()
                 .zrevrange(Self::user_player_skill_score_key(group_id), 0, 100)?;
         // Users never will be deleted, so there is no race here.
@@ -417,7 +448,7 @@ impl Store {
     pub fn read_games(
         &mut self,
         group_id: &GroupId,
-        game_ids: &Vec<GameId>,
+        game_ids: &[GameId],
     ) -> Result<Vec<Game>, Error> {
         game_ids
             .iter()
@@ -450,7 +481,7 @@ impl Store {
                         .cmd("WATCH")
                         .arg(&games_key)
                         .ignore()
-                        .zrevrank(&games_key, game_id)
+                        .zrevrank(&games_key, game_id.0.clone())
                         .query(con)?;
                     Ok(rank + 1)
                 })
@@ -473,10 +504,10 @@ impl Store {
     pub fn create_game(
         &mut self,
         group_id: &GroupId,
-        winner_ids: &Vec<UserId>,
-        loser_ids: &Vec<UserId>,
+        winner_ids: &[UserId],
+        loser_ids: &[UserId],
     ) -> Result<Game, Error> {
-        let game_id = uuid::Uuid::new_v4().simple().to_string();
+        let game_id = GameId(uuid::Uuid::new_v4().simple().to_string());
         let key = Self::game_key(group_id, &game_id);
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -484,9 +515,9 @@ impl Store {
             .as_millis();
         let game = Game {
             id: game_id,
-            timestamp: timestamp,
-            winner_ids: winner_ids.clone(),
-            loser_ids: loser_ids.clone(),
+            timestamp,
+            winner_ids: winner_ids.to_owned(),
+            loser_ids: loser_ids.to_owned(),
         };
 
         let timestamp_str = format!("{}", timestamp);
@@ -498,12 +529,13 @@ impl Store {
                 // lambda.
                 let mut ctx = UserStoreCtx {
                     con,
+                    group_id: group_id.clone(),
                     cache: HashMap::new(),
                 };
                 let mut winners = winner_ids
                     .iter()
                     .map(|user_id| {
-                        merge::find(Self::user_key(group_id, user_id))
+                        merge::find(user_id.clone())
                             .run(&mut ctx)
                             .map(|user| user.latest())
                     })
@@ -511,7 +543,7 @@ impl Store {
                 let mut losers = loser_ids
                     .iter()
                     .map(|user_id| {
-                        merge::find(Self::user_key(group_id, user_id))
+                        merge::find(user_id.clone())
                             .run(&mut ctx)
                             .map(|user| user.latest())
                     })
@@ -531,39 +563,33 @@ impl Store {
                 );
                 for (winner, update) in winners.iter_mut().zip(winner_updates) {
                     winner.player.skill = winner.player.skill.include(&update);
-                    merge::set(
-                        Self::user_key(group_id, &winner.id),
-                        VersionedUser::new(winner.clone()),
-                    )
-                    .run(&mut ctx)?;
+                    merge::set(winner.id.clone(), VersionedUser::new(winner.clone()))
+                        .run(&mut ctx)?;
                     pipe.zadd(
                         Self::user_games_key(group_id, &winner.id),
-                        &game.id,
+                        &game.id.0,
                         &timestamp_str,
                     );
                 }
                 for (loser, update) in losers.iter_mut().zip(loser_updates) {
                     loser.player.skill = loser.player.skill.include(&update);
-                    merge::set(
-                        Self::user_key(group_id, &loser.id),
-                        VersionedUser::new(loser.clone()),
-                    )
-                    .run(&mut ctx)?;
+                    merge::set(loser.id.clone(), VersionedUser::new(loser.clone()))
+                        .run(&mut ctx)?;
                     pipe.zadd(
                         Self::user_games_key(group_id, &loser.id),
-                        &game.id,
+                        &game.id.0,
                         &timestamp_str,
                     );
                 }
                 let scores = winners
                     .iter()
                     .chain(losers.iter())
-                    .map(|user| (Self::map_score(user), user.id.to_owned()))
+                    .map(|user| (Self::map_score(user), user.id.0.clone()))
                     .collect::<Vec<_>>();
 
                 ctx.append(pipe);
                 pipe.set(&key, RedisJson(VersionedGame::new(game.clone())))
-                    .zadd(Self::games_key(group_id), &game.id, &timestamp_str)
+                    .zadd(Self::games_key(group_id), &game.id.0, &timestamp_str)
                     .zadd_multiple(Self::user_player_skill_score_key(group_id), &scores);
                 Ok(())
             },
@@ -577,7 +603,7 @@ impl Store {
     }
 
     fn group_key_prefix(group_id: &GroupId) -> String {
-        "group:".to_owned() + group_id
+        "group:".to_owned() + &group_id.0
     }
 
     fn user_player_skill_score_key(group_id: &GroupId) -> String {
@@ -589,15 +615,15 @@ impl Store {
     }
 
     fn user_key(group_id: &GroupId, user_id: &UserId) -> String {
-        Self::group_key_prefix(group_id) + ":user:" + user_id
+        Self::group_key_prefix(group_id) + ":user:" + &user_id.0
     }
 
     fn user_games_key(group_id: &GroupId, user_id: &UserId) -> String {
-        Self::group_key_prefix(group_id) + ":user.games:" + user_id
+        Self::group_key_prefix(group_id) + ":user.games:" + &user_id.0
     }
 
     fn game_key(group_id: &GroupId, game_id: &GameId) -> String {
-        Self::group_key_prefix(group_id) + ":game:" + game_id
+        Self::group_key_prefix(group_id) + ":game:" + &game_id.0
     }
 
     fn games_key(group_id: &GroupId) -> String {

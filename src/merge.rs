@@ -260,7 +260,7 @@ where
             left.parent_index = right_index;
             ctx.set_node(&left_index, Mergeable::wrap(left));
 
-            return Ok(Mergeable::wrap(right));
+            Ok(Mergeable::wrap(right))
         } else {
             (self.merge_op)(&right.item, &mut left.item);
             if left.rank == right.rank {
@@ -270,7 +270,7 @@ where
             right.parent_index = left_index;
             ctx.set_node(&right_index, Mergeable::wrap(right));
 
-            return Ok(Mergeable::wrap(left));
+            Ok(Mergeable::wrap(left))
         }
     }
 }
@@ -282,6 +282,7 @@ where
     V: Clone,
     C: MergeCtx<Index = K, Item = V>,
 {
+    // TODO(mkiefel): key should be passed as reference.
     let find_op = Find::new(index);
     find_op.map(|node| node.latest().item)
 }

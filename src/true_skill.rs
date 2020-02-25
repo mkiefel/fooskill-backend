@@ -53,13 +53,15 @@ pub struct Player {
     pub skill: Message,
 }
 
-impl Player {
-    pub fn new() -> Player {
+impl Default for Player {
+    fn default() -> Self {
         Player {
             skill: Message::from_mu_sigma2(Player::default_mean(), Player::default_sigma2()),
         }
     }
+}
 
+impl Player {
     pub fn default_mean() -> f64 {
         25.0
     }
@@ -93,7 +95,7 @@ impl TrueSkill {
         }
     }
 
-    fn from_skill(&self, skill: &Message) -> Message {
+    fn pass_from_skill(&self, skill: &Message) -> Message {
         let c2 = self.beta.powi(2);
         let a = 1.0 / (1.0 + c2 * skill.pi);
         Message {
@@ -102,7 +104,7 @@ impl TrueSkill {
         }
     }
 
-    fn weighted_pass(weighted_messages: &[(f64, Message)]) -> Message {
+    fn pass_weighted(weighted_messages: &[(f64, Message)]) -> Message {
         // TODO(mkiefel): this could potentially also a fold and take an iterator as
         // input.
         let pi = 1.0
@@ -118,8 +120,8 @@ impl TrueSkill {
         Message { pi, tau }
     }
 
-    fn from_performance(messages: &[Message]) -> Message {
-        TrueSkill::weighted_pass(
+    fn pass_from_performance(messages: &[Message]) -> Message {
+        TrueSkill::pass_weighted(
             &messages
                 .iter()
                 .map(|message| (1.0, *message))
@@ -127,9 +129,9 @@ impl TrueSkill {
         )
     }
 
-    fn to_difference(left: Message, right: Message) -> Message {
+    fn pass_to_difference(left: Message, right: Message) -> Message {
         let difference_messages = [(1.0, left), (-1.0, right)];
-        TrueSkill::weighted_pass(&difference_messages)
+        TrueSkill::pass_weighted(&difference_messages)
     }
 
     fn norm_pdf(x: f64) -> f64 {
@@ -190,7 +192,7 @@ impl TrueSkill {
         }
     }
 
-    fn from_difference(
+    fn pass_from_difference(
         left_message: Message,
         right_message: Message,
         to_difference_message: Message,
@@ -198,12 +200,12 @@ impl TrueSkill {
         let left_messages = [(1.0, right_message), (1.0, to_difference_message)];
         let right_messages = [(1.0, left_message), (-1.0, to_difference_message)];
         (
-            TrueSkill::weighted_pass(&left_messages),
-            TrueSkill::weighted_pass(&right_messages),
+            TrueSkill::pass_weighted(&left_messages),
+            TrueSkill::pass_weighted(&right_messages),
         )
     }
 
-    fn to_performance(
+    fn pass_to_performance(
         from_performance_messages: &[Message],
         update_message: &Message,
     ) -> Vec<Message> {
@@ -216,15 +218,15 @@ impl TrueSkill {
         for i in 0..weighted_messages.len() {
             weighted_messages[i].0 = 1.0;
             weighted_messages[i].1 = *update_message;
-            out_messages[i] = TrueSkill::weighted_pass(&weighted_messages);
+            out_messages[i] = TrueSkill::pass_weighted(&weighted_messages);
             weighted_messages[i].0 = -1.0;
             weighted_messages[i].1 = from_performance_messages[i];
         }
-        return out_messages;
+        out_messages
     }
 
     fn to_skill(&self, message: &Message) -> Message {
-        self.from_skill(message)
+        self.pass_from_skill(message)
     }
 
     /// Passes all input team messages down the message tree and returns the
@@ -242,37 +244,38 @@ impl TrueSkill {
 
         let left_performances = left_team
             .iter()
-            .map(|message| self.from_skill(message))
+            .map(|message| self.pass_from_skill(message))
             .collect::<Vec<_>>();
 
         let right_performances = right_team
             .iter()
-            .map(|message| self.from_skill(message))
+            .map(|message| self.pass_from_skill(message))
             .collect::<Vec<_>>();
 
-        let left_performance = TrueSkill::from_performance(&left_performances);
-        let right_performance = TrueSkill::from_performance(&right_performances);
+        let left_performance = TrueSkill::pass_from_performance(&left_performances);
+        let right_performance = TrueSkill::pass_from_performance(&right_performances);
 
         let to_difference_message =
-            TrueSkill::to_difference(left_performance, right_performance);
+            TrueSkill::pass_to_difference(left_performance, right_performance);
         let marginal = match result {
             GameResult::Won => self.difference_marginal_won(&to_difference_message),
             GameResult::Draw => self.difference_marginal_draw(&to_difference_message),
             _ => panic!("cannot have Lost here"),
         };
 
-        let from_difference_message = TrueSkill::from_difference(
+        let from_difference_message = TrueSkill::pass_from_difference(
             left_performance,
             right_performance,
             marginal.exclude(&to_difference_message),
         );
 
-        let left_skills = TrueSkill::to_performance(&left_performances, &from_difference_message.0)
-            .iter()
-            .map(|message| self.to_skill(message))
-            .collect::<Vec<_>>();
+        let left_skills =
+            TrueSkill::pass_to_performance(&left_performances, &from_difference_message.0)
+                .iter()
+                .map(|message| self.to_skill(message))
+                .collect::<Vec<_>>();
         let right_skills =
-            TrueSkill::to_performance(&right_performances, &from_difference_message.1)
+            TrueSkill::pass_to_performance(&right_performances, &from_difference_message.1)
                 .iter()
                 .map(|message| self.to_skill(message))
                 .collect::<Vec<_>>();
