@@ -11,6 +11,8 @@ extern crate serde_derive;
 
 mod api;
 mod merge;
+mod message;
+mod player;
 mod store;
 mod true_skill;
 

@@ -11,7 +11,8 @@ use rocket_contrib::databases::{r2d2, DatabaseConfig, DbError, Poolable};
 use transaction::Transaction;
 
 use crate::merge;
-use crate::true_skill::{GameResult, Player, TrueSkill};
+use crate::player::Player;
+use crate::true_skill::{GameResult, TrueSkill};
 
 // Thin wrapper around r2d2_redis to implement Poolable for a newer version of
 // redis-rs.
@@ -604,20 +605,30 @@ impl Store {
                     })
                     .collect::<Result<Vec<User>, _>>()?;
 
-                let true_skill = TrueSkill::new(Player::default_sigma());
+                // eps set by
+                //   0.2166588675713617 = 2 * normcdf(eps / (sqrt 2 * ((25.0 / 3.0) / 2.0))) - 1
+                // >> norminv(1.2166588675713617 / 2)
+                // ans =
+                //   0.2750
+                let true_skill = TrueSkill::new(
+                    Player::default_sigma() / 2.0,
+                    0.2750 * 2.0f64.sqrt() * Player::default_sigma() / 2.0,
+                );
                 let (winner_updates, loser_updates) = true_skill.tree_pass(
                     &winners
                         .iter()
-                        .map(|user| user.player.skill)
+                        .map(|user| user.player.skill().clone())
                         .collect::<Vec<_>>(),
                     &losers
                         .iter()
-                        .map(|user| user.player.skill)
+                        .map(|user| user.player.skill().clone())
                         .collect::<Vec<_>>(),
                     GameResult::Won,
                 );
                 for (winner, update) in winners.iter_mut().zip(winner_updates) {
-                    winner.player.skill = winner.player.skill.include(&update);
+                    winner
+                        .player
+                        .set_skill(winner.player.skill().include(&update));
                     merge::set(winner.id.clone(), StoredUser::wrap(winner.clone()))
                         .run(&mut ctx)?;
                     pipe.zadd(
@@ -627,7 +638,9 @@ impl Store {
                     );
                 }
                 for (loser, update) in losers.iter_mut().zip(loser_updates) {
-                    loser.player.skill = loser.player.skill.include(&update);
+                    loser
+                        .player
+                        .set_skill(loser.player.skill().include(&update));
                     merge::set(loser.id.clone(), StoredUser::wrap(loser.clone())).run(&mut ctx)?;
                     pipe.zadd(
                         Self::user_games_key(group_id, &loser.id),
@@ -652,7 +665,7 @@ impl Store {
     }
 
     fn map_score(user: &User) -> f64 {
-        let (mu, sigma2) = user.player.skill.to_mu_sigma2();
+        let (mu, sigma2) = user.player.skill().to_mu_sigma2();
         mu - 2.0 * sigma2.sqrt()
     }
 

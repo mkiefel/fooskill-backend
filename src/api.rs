@@ -1,7 +1,7 @@
 use rocket_contrib::json::Json;
 
 use crate::store::{decode_and_validate_group_id, Error, GameId, GroupKey, Store, UserId};
-use crate::true_skill::Player;
+use crate::player::Player;
 
 #[derive(Serialize, Debug)]
 struct Game {

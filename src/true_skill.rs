@@ -1,79 +1,11 @@
 use std::f64;
 
+use crate::message::Message;
+
 pub enum GameResult {
     Won,
     Draw,
     Lost,
-}
-
-/// Gaussian message.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
-pub struct Message {
-    pi: f64,
-    tau: f64,
-}
-
-impl Message {
-    /// Initializes a Message from the regular Gaussian parameters.
-    fn from_mu_sigma2(mu: f64, sigma2: f64) -> Message {
-        Message {
-            pi: 1.0 / sigma2,
-            tau: mu / sigma2,
-        }
-    }
-
-    /// Returns the regular Gaussian parameters for a message.
-    pub fn to_mu_sigma2(&self) -> (f64, f64) {
-        let sigma2 = 1.0 / self.pi;
-        let mu = self.tau * sigma2;
-        (mu, sigma2)
-    }
-
-    /// Includes the belief of the other message into this one.
-    pub fn include(&self, rhs: &Message) -> Message {
-        Message {
-            pi: self.pi + rhs.pi,
-            tau: self.tau + rhs.tau,
-        }
-    }
-
-    /// Removes the belief of the other message from this one.
-    pub fn exclude(&self, rhs: &Message) -> Message {
-        Message {
-            pi: self.pi - rhs.pi,
-            tau: self.tau - rhs.tau,
-        }
-    }
-}
-
-/// Represents a player.
-#[derive(Serialize, Clone, Deserialize, Debug)]
-pub struct Player {
-    // TODO(mkiefel): remove visibility of members.
-    /// Represents the combined belief of the skill of this player.
-    pub skill: Message
-}
-
-impl Default for Player {
-    fn default() -> Self {
-        Player {
-            skill: Message::from_mu_sigma2(Player::default_mean(), Player::default_sigma2()),
-        }
-    }
-}
-
-impl Player {
-    pub fn default_mean() -> f64 {
-        25.0
-    }
-
-    pub fn default_sigma() -> f64 {
-        Player::default_mean() / 3.0
-    }
-
-    pub fn default_sigma2() -> f64 {
-        Player::default_sigma().powi(2)
-    }
 }
 
 /// Implements the TrueSkill ranking algorithm.
@@ -83,16 +15,17 @@ pub struct TrueSkill {
 }
 
 impl TrueSkill {
-    pub fn new(default_sigma: f64) -> TrueSkill {
-        // eps set by
-        //   0.2166588675713617 = 2 * normcdf(eps / (sqrt 2 * ((25.0 / 3.0) / 2.0))) - 1
-        // >> norminv(1.2166588675713617 / 2)
-        // ans =
-        //   0.2750
-        let beta = default_sigma / 2.0;
+    /// Makes a new TrueSkill estimator.
+    ///
+    /// # Arguments
+    ///
+    /// * `beta` standard deviation of the sampled game skill from a player's
+    ///    skill.
+    /// * `eps` draw margin around 0.
+    pub fn new(beta: f64, eps: f64) -> Self {
         TrueSkill {
             beta,
-            eps: 0.2750 * 2.0f64.sqrt() * beta,
+            eps,
         }
     }
 
