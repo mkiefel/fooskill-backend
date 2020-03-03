@@ -1,72 +1,56 @@
 #![feature(proc_macro_hygiene, decl_macro)]
 
 #[macro_use]
-extern crate quick_error;
-#[macro_use]
 extern crate rocket;
 #[macro_use]
-extern crate rocket_contrib;
-#[macro_use]
 extern crate serde_derive;
-
-mod api;
-mod merge;
-mod message;
-mod player;
-mod store;
-mod true_skill;
 
 use std::collections::HashMap;
 
 use rocket_contrib::serve::{Options, StaticFiles};
 use rocket_contrib::templates;
 
-use store::Store;
-
-impl<'r> rocket::request::FromParam<'r> for store::UserId {
-    type Error = &'r rocket::http::RawStr;
-
-    fn from_param(param: &'r rocket::http::RawStr) -> Result<Self, Self::Error> {
-        param
-            .percent_decode()
-            .map(|cow| cow.into_owned().into())
-            .map_err(|_| param)
-    }
-}
+use fooskill::api;
+use fooskill::skill_base;
+use fooskill::store::Store;
 
 /// Repesents a game with all players being resolved to their user data.
 #[derive(Serialize, Debug)]
 struct JoinedGame {
-    winners: Vec<store::User>,
-    losers: Vec<store::User>,
+    winners: Vec<skill_base::User>,
+    losers: Vec<skill_base::User>,
 }
 
 /// Used to render the user detail page.
 #[derive(Serialize, Debug)]
 struct GetUserContext {
     secret_group_id: String,
-    user: store::User,
+    user: skill_base::User,
     games: Vec<JoinedGame>,
 }
 
 #[get("/<secret_group_id>/users/<user_id>")]
 fn user(
     mut store: Store,
-    group_key: rocket::State<store::GroupKey>,
+    group_key: rocket::State<skill_base::GroupKey>,
     secret_group_id: String,
-    user_id: store::UserId,
-) -> Result<templates::Template, store::Error> {
-    let group_id = store::decode_and_validate_group_id(&group_key, secret_group_id.clone())?;
-    let users = store.read_users(&group_id, &[user_id.clone()])?;
+    user_id: skill_base::UserId,
+) -> Result<templates::Template, skill_base::Error> {
+    let group_id = skill_base::decode_and_validate_group_id(&group_key, secret_group_id.clone())?;
+    let users = skill_base::read_users(&mut store, &group_id, &[user_id.clone()])?;
     let user = users.first().unwrap();
-    let games = store.get_recent_games(&group_id, &user_id)?;
+    let games = skill_base::get_recent_games(&mut store, &group_id, &user_id)?;
     let joined_games = games
         .iter()
-        .map(|game: &store::Game| -> Result<JoinedGame, store::Error> {
-            let winners = store.read_users(&group_id, &game.clone().winner_ids())?;
-            let losers = store.read_users(&group_id, &game.clone().loser_ids())?;
-            Ok(JoinedGame { winners, losers })
-        })
+        .map(
+            |game: &skill_base::Game| -> Result<JoinedGame, skill_base::Error> {
+                let winners =
+                    skill_base::read_users(&mut store, &group_id, &game.clone().winner_ids())?;
+                let losers =
+                    skill_base::read_users(&mut store, &group_id, &game.clone().loser_ids())?;
+                Ok(JoinedGame { winners, losers })
+            },
+        )
         .collect::<Result<Vec<JoinedGame>, _>>()?;
     let context = GetUserContext {
         secret_group_id: percent_encoding::utf8_percent_encode(
@@ -117,7 +101,7 @@ fn main() {
                     .config()
                     .get_str("group_key")
                     .ok()
-                    .and_then(|key| store::GroupKey::new(key.to_owned()));
+                    .and_then(|key| skill_base::GroupKey::new(key.to_owned()));
 
                 match maybe_key {
                     Some(key) => Ok(rocket.manage(key)),
