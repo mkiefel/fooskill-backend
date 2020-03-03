@@ -605,15 +605,7 @@ impl Store {
                     })
                     .collect::<Result<Vec<User>, _>>()?;
 
-                // eps set by
-                //   0.2166588675713617 = 2 * normcdf(eps / (sqrt 2 * ((25.0 / 3.0) / 2.0))) - 1
-                // >> norminv(1.2166588675713617 / 2)
-                // ans =
-                //   0.2750
-                let true_skill = TrueSkill::new(
-                    Player::default_sigma() / 2.0,
-                    0.2750 * 2.0f64.sqrt() * Player::default_sigma() / 2.0,
-                );
+                let true_skill = TrueSkill::new(Player::default_sigma() / 2.0, 0.0);
                 let (winner_updates, loser_updates) = true_skill.tree_pass(
                     &winners
                         .iter()
