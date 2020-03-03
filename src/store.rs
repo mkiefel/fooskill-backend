@@ -1,6 +1,6 @@
 use std::collections::HashMap;
+use std::convert::TryInto;
 use std::ops::{Deref, DerefMut};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use derive_more::From;
 use redis::{self, Commands, PipelineCommands};
@@ -116,51 +116,100 @@ pub fn decode_and_validate_group_id(
 }
 
 #[derive(Serialize, Clone, Deserialize, Debug)]
-pub enum VersionedUser {
+enum StoredUser {
     V0(User),
 }
 
 #[derive(Serialize, Clone, Deserialize, Debug)]
 pub struct User {
-    pub id: UserId,
-    pub name: String,
-    pub player: Player,
+    id: UserId,
+    name: String,
+    player: Player,
 }
 
-impl VersionedUser {
-    fn new(user: User) -> Self {
-        VersionedUser::V0(user)
+impl StoredUser {
+    fn wrap(inner: User) -> Self {
+        StoredUser::V0(inner)
     }
 
     fn latest(self) -> User {
         match self {
-            VersionedUser::V0(user) => user,
+            StoredUser::V0(user) => user,
         }
     }
 }
 
+impl User {
+    pub fn id(&self) -> &UserId {
+        &self.id
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn player(&self) -> &Player {
+        &self.player
+    }
+}
+
 #[derive(Serialize, Clone, Deserialize, Debug)]
-pub enum VersionedGame {
-    V0(Game),
+enum StoredGame {
+    V0(GameV0),
+    V1(Game),
+}
+
+#[derive(Serialize, Clone, Deserialize, Debug)]
+pub struct GameV0 {
+    id: GameId,
+    timestamp: u128,
+    winner_ids: Vec<UserId>,
+    loser_ids: Vec<UserId>,
 }
 
 #[derive(Serialize, Clone, Deserialize, Debug)]
 pub struct Game {
-    pub id: GameId,
-    pub timestamp: u128,
-    pub winner_ids: Vec<UserId>,
-    pub loser_ids: Vec<UserId>,
+    id: GameId,
+    datetime: chrono::DateTime<chrono::Utc>,
+    winner_ids: Vec<UserId>,
+    loser_ids: Vec<UserId>,
 }
 
-impl VersionedGame {
-    fn new(game: Game) -> Self {
-        VersionedGame::V0(game)
+impl StoredGame {
+    fn wrap(inner: Game) -> Self {
+        StoredGame::V1(inner)
     }
 
     fn latest(self) -> Game {
         match self {
-            VersionedGame::V0(game) => game,
+            StoredGame::V0(game) => Game {
+                id: game.id,
+                datetime: chrono::DateTime::<chrono::Utc>::from_utc(
+                    chrono::NaiveDateTime::from_timestamp(
+                        (game.timestamp / 1000).try_into().unwrap(),
+                        (game.timestamp % 1000 * 1_000_000).try_into().unwrap(),
+                    ),
+                    chrono::Utc,
+                ),
+                winner_ids: game.winner_ids,
+                loser_ids: game.loser_ids,
+            },
+            StoredGame::V1(game) => game,
         }
+    }
+}
+
+impl Game {
+    pub fn winner_ids(&self) -> &Vec<UserId> {
+        &self.winner_ids
+    }
+
+    pub fn loser_ids(&self) -> &Vec<UserId> {
+        &self.loser_ids
+    }
+
+    pub fn id(&self) -> &GameId {
+        &self.id
     }
 }
 
@@ -250,7 +299,7 @@ where
 {
     con: &'a mut C,
     group_id: GroupId,
-    cache: HashMap<UserId, merge::Mergeable<UserId, VersionedUser>>,
+    cache: HashMap<UserId, merge::StoredMergeable<UserId, StoredUser>>,
 }
 
 impl<'a, C> UserStoreCtx<'a, C>
@@ -269,12 +318,12 @@ where
     C: redis::ConnectionLike,
 {
     type Index = UserId;
-    type Item = VersionedUser;
+    type Item = StoredUser;
 
     fn get_node(
         &mut self,
         index: &Self::Index,
-    ) -> Option<merge::Mergeable<Self::Index, Self::Item>> {
+    ) -> Option<merge::StoredMergeable<Self::Index, Self::Item>> {
         // First check if this key is already in our local read cache.
         if let Some(cache_item) = self.cache.get(index) {
             return Some(cache_item.clone());
@@ -286,7 +335,7 @@ where
         self.con
             .get(&user_key)
             .map(
-                |RedisJson::<merge::Mergeable<Self::Index, Self::Item>>(node)| {
+                |RedisJson::<merge::StoredMergeable<Self::Index, Self::Item>>(node)| {
                     // Insert into cache for the next lookup.
                     self.cache.insert(index.clone(), node.clone());
                     node
@@ -295,7 +344,11 @@ where
             .ok()
     }
 
-    fn set_node(&mut self, index: &Self::Index, item: merge::Mergeable<Self::Index, Self::Item>) {
+    fn set_node(
+        &mut self,
+        index: &Self::Index,
+        item: merge::StoredMergeable<Self::Index, Self::Item>,
+    ) {
         // The value is just set in the cache. Only when the transaction is
         // committed, it will be written to the store.
         self.cache.insert(index.clone(), item);
@@ -340,7 +393,7 @@ impl Store {
         for entry in entries {
             let splits = entry.split(':').collect::<Vec<_>>();
             if splits.len() >= 2 {
-                user_ids.push(UserId(splits.last().unwrap().to_string()));
+                user_ids.push(UserId((*splits.last().unwrap()).to_string()));
             }
         }
         Ok(user_ids)
@@ -363,7 +416,7 @@ impl Store {
                 .map(|user_id| {
                     merge::find(user_id.clone())
                         .run(&mut ctx)
-                        .map(|user| user.latest())
+                        .map(|versioned| versioned.latest())
                 })
                 .collect::<Result<Vec<User>, _>>();
             ctx.append(pipe);
@@ -401,8 +454,8 @@ impl Store {
                 player: Default::default(),
             };
             // TODO(mkiefel): Move this into the merge logic.
-            let node: merge::Mergeable<UserId, VersionedUser> =
-                merge::Mergeable::new(user_id.clone(), VersionedUser::new(user.clone()));
+            let node: merge::StoredMergeable<UserId, StoredUser> =
+                merge::StoredMergeable::new(user_id.clone(), StoredUser::wrap(user.clone()));
             pipe.set(&key, RedisJson(&node))
                 .ignore()
                 .zadd(&user_name_index, index_entry.clone(), 0_f32)
@@ -455,7 +508,7 @@ impl Store {
             .map(|game_id| {
                 self.con()
                     .get(Self::game_key(group_id, &game_id))
-                    .map(|RedisJson::<VersionedGame>(versioned_game)| versioned_game.latest())
+                    .map(|RedisJson::<StoredGame>(versioned)| versioned.latest())
             })
             .collect::<Result<_, _>>()
             .map_err(|err| err.into())
@@ -513,18 +566,14 @@ impl Store {
     ) -> Result<Game, Error> {
         let game_id = GameId(uuid::Uuid::new_v4().simple().to_string());
         let key = Self::game_key(group_id, &game_id);
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("backwards?")
-            .as_millis();
         let game = Game {
             id: game_id,
-            timestamp,
+            datetime: chrono::Utc::now(),
             winner_ids: winner_ids.to_owned(),
             loser_ids: loser_ids.to_owned(),
         };
 
-        let timestamp_str = format!("{}", timestamp);
+        let timestamp_key = format!("{}", game.datetime.naive_utc().timestamp_millis());
 
         commit(
             self.con(),
@@ -567,22 +616,21 @@ impl Store {
                 );
                 for (winner, update) in winners.iter_mut().zip(winner_updates) {
                     winner.player.skill = winner.player.skill.include(&update);
-                    merge::set(winner.id.clone(), VersionedUser::new(winner.clone()))
+                    merge::set(winner.id.clone(), StoredUser::wrap(winner.clone()))
                         .run(&mut ctx)?;
                     pipe.zadd(
                         Self::user_games_key(group_id, &winner.id),
                         &game.id.0,
-                        &timestamp_str,
+                        &timestamp_key,
                     );
                 }
                 for (loser, update) in losers.iter_mut().zip(loser_updates) {
                     loser.player.skill = loser.player.skill.include(&update);
-                    merge::set(loser.id.clone(), VersionedUser::new(loser.clone()))
-                        .run(&mut ctx)?;
+                    merge::set(loser.id.clone(), StoredUser::wrap(loser.clone())).run(&mut ctx)?;
                     pipe.zadd(
                         Self::user_games_key(group_id, &loser.id),
                         &game.id.0,
-                        &timestamp_str,
+                        &timestamp_key,
                     );
                 }
                 let scores = winners
@@ -592,8 +640,8 @@ impl Store {
                     .collect::<Vec<_>>();
 
                 ctx.append(pipe);
-                pipe.set(&key, RedisJson(VersionedGame::new(game.clone())))
-                    .zadd(Self::games_key(group_id), &game.id.0, &timestamp_str)
+                pipe.set(&key, RedisJson(StoredGame::wrap(game.clone())))
+                    .zadd(Self::games_key(group_id), &game.id.0, &timestamp_key)
                     .zadd_multiple(Self::user_player_skill_score_key(group_id), &scores);
                 Ok(())
             },

@@ -6,17 +6,17 @@ use transaction::Transaction;
 /// Represents a versioned version of an object that can be merged with the
 /// implementation in this module.
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub enum Mergeable<I, T>
+pub enum StoredMergeable<I, T>
 where
     I: Eq,
 {
-    V0(MergeableV0<I, T>),
+    V0(Mergeable<I, T>),
 }
 
 /// Contains all version 0 information for a node that can be merged in the
 /// forest.
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct MergeableV0<I, T>
+pub struct Mergeable<I, T>
 where
     I: Eq,
 {
@@ -27,12 +27,12 @@ where
     item: T,
 }
 
-impl<I, T> Mergeable<I, T>
+impl<I, T> StoredMergeable<I, T>
 where
     I: Eq,
 {
     pub fn new(index: I, item: T) -> Self {
-        Mergeable::V0(MergeableV0 {
+        StoredMergeable::V0(Mergeable {
             parent_index: index,
             rank: 0,
             item,
@@ -40,19 +40,19 @@ where
     }
 
     /// Unwraps to the latest node.
-    fn latest(self) -> MergeableV0<I, T> {
+    fn latest(self) -> Mergeable<I, T> {
         match self {
-            Mergeable::V0(inner) => inner,
+            StoredMergeable::V0(inner) => inner,
         }
     }
 
     /// Wraps a node into a versioned node.
-    fn wrap(inner: MergeableV0<I, T>) -> Self {
-        Mergeable::V0(inner)
+    fn wrap(inner: Mergeable<I, T>) -> Self {
+        StoredMergeable::V0(inner)
     }
 }
 
-impl<I, T> MergeableV0<I, T>
+impl<I, T> Mergeable<I, T>
 where
     I: Eq,
 {
@@ -71,14 +71,15 @@ pub trait MergeCtx {
     /// # Arguments
     ///
     /// * `index` index of the node to lookup.
-    fn get_node(&mut self, index: &Self::Index) -> Option<Mergeable<Self::Index, Self::Item>>;
+    fn get_node(&mut self, index: &Self::Index)
+        -> Option<StoredMergeable<Self::Index, Self::Item>>;
 
     /// Sets a node inside the storage.
     ///
     /// # Arguments
     ///
     /// * `index` index of the node to lookup.
-    fn set_node(&mut self, index: &Self::Index, item: Mergeable<Self::Index, Self::Item>);
+    fn set_node(&mut self, index: &Self::Index, item: StoredMergeable<Self::Index, Self::Item>);
 }
 
 /// Represents a merge error.
@@ -149,7 +150,7 @@ where
         let mut node = Find::new(self.index.clone()).run(ctx)?.latest();
         node.item = self.item.clone();
         let index = node.parent_index.clone();
-        ctx.set_node(&index, Mergeable::wrap(node));
+        ctx.set_node(&index, StoredMergeable::wrap(node));
         Ok(())
     }
 }
@@ -176,7 +177,7 @@ where
     C: MergeCtx<Index = K, Item = V>,
 {
     type Ctx = C;
-    type Item = Mergeable<K, V>;
+    type Item = StoredMergeable<K, V>;
     type Err = Error<K>;
 
     fn run(&self, ctx: &mut Self::Ctx) -> Result<Self::Item, Self::Err> {
@@ -194,13 +195,13 @@ where
                 .latest();
 
             node.parent_index = parent.parent_index.clone();
-            ctx.set_node(&index, Mergeable::wrap(node));
+            ctx.set_node(&index, StoredMergeable::wrap(node));
 
             index = parent_index;
             node = parent;
         }
 
-        Ok(Mergeable::wrap(node))
+        Ok(StoredMergeable::wrap(node))
     }
 }
 
@@ -241,7 +242,7 @@ where
     F: Fn(&V, &mut V),
 {
     type Ctx = C;
-    type Item = Mergeable<K, V>;
+    type Item = StoredMergeable<K, V>;
     type Err = Error<K>;
 
     fn run(&self, ctx: &mut Self::Ctx) -> Result<Self::Item, Self::Err> {
@@ -251,26 +252,26 @@ where
         let right_index = right.parent_index.clone();
 
         if left_index == right_index {
-            return Ok(Mergeable::wrap(left));
+            return Ok(StoredMergeable::wrap(left));
         }
 
         if left.rank < right.rank {
             (self.merge_op)(&left.item, &mut right.item);
-            ctx.set_node(&right_index, Mergeable::wrap(right.clone()));
+            ctx.set_node(&right_index, StoredMergeable::wrap(right.clone()));
             left.parent_index = right_index;
-            ctx.set_node(&left_index, Mergeable::wrap(left));
+            ctx.set_node(&left_index, StoredMergeable::wrap(left));
 
-            Ok(Mergeable::wrap(right))
+            Ok(StoredMergeable::wrap(right))
         } else {
             (self.merge_op)(&right.item, &mut left.item);
             if left.rank == right.rank {
                 left.rank += 1;
             }
-            ctx.set_node(&left_index, Mergeable::wrap(left.clone()));
+            ctx.set_node(&left_index, StoredMergeable::wrap(left.clone()));
             right.parent_index = left_index;
-            ctx.set_node(&right_index, Mergeable::wrap(right));
+            ctx.set_node(&right_index, StoredMergeable::wrap(right));
 
-            Ok(Mergeable::wrap(left))
+            Ok(StoredMergeable::wrap(left))
         }
     }
 }
@@ -319,23 +320,30 @@ mod tests {
 
     #[derive(Debug)]
     struct MemoryStore {
-        elements: Vec<Mergeable<usize, String>>,
+        elements: Vec<StoredMergeable<usize, String>>,
     }
 
     #[derive(Debug)]
     struct MemoryStoreCtx {
-        write_elements: Vec<Mergeable<usize, String>>,
+        write_elements: Vec<StoredMergeable<usize, String>>,
     }
 
     impl MergeCtx for MemoryStoreCtx {
         type Index = usize;
         type Item = String;
 
-        fn get_node(&mut self, index: &Self::Index) -> Option<Mergeable<Self::Index, Self::Item>> {
+        fn get_node(
+            &mut self,
+            index: &Self::Index,
+        ) -> Option<StoredMergeable<Self::Index, Self::Item>> {
             self.write_elements.get(*index).map(|s| s.to_owned())
         }
 
-        fn set_node(&mut self, index: &Self::Index, item: Mergeable<Self::Index, Self::Item>) {
+        fn set_node(
+            &mut self,
+            index: &Self::Index,
+            item: StoredMergeable<Self::Index, Self::Item>,
+        ) {
             self.write_elements
                 .get_mut(*index)
                 .map(|element| *element = item);
@@ -359,9 +367,9 @@ mod tests {
     fn simple_store() -> MemoryStore {
         MemoryStore {
             elements: vec![
-                Mergeable::new(0, "first".to_owned()),
-                Mergeable::new(1, "second".to_owned()),
-                Mergeable::new(2, "third".to_owned()),
+                StoredMergeable::new(0, "first".to_owned()),
+                StoredMergeable::new(1, "second".to_owned()),
+                StoredMergeable::new(2, "third".to_owned()),
             ],
         }
     }
@@ -413,7 +421,7 @@ mod tests {
     #[test]
     fn test_missing_parent() {
         let mut store = MemoryStore {
-            elements: vec![Mergeable::new(1, "first".to_owned())],
+            elements: vec![StoredMergeable::new(1, "first".to_owned())],
         };
         let missing_parent = store.run(&find(0));
         match missing_parent {
@@ -426,10 +434,10 @@ mod tests {
     fn test_path_halving() {
         let mut store = MemoryStore {
             elements: vec![
-                Mergeable::new(0, "first".to_owned()),
-                Mergeable::new(0, "second".to_owned()),
-                Mergeable::new(1, "third".to_owned()),
-                Mergeable::new(2, "forth".to_owned()),
+                StoredMergeable::new(0, "first".to_owned()),
+                StoredMergeable::new(0, "second".to_owned()),
+                StoredMergeable::new(1, "third".to_owned()),
+                StoredMergeable::new(2, "forth".to_owned()),
             ],
         };
         let find_on_leaf = store.run(&find(3));

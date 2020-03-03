@@ -61,8 +61,8 @@ fn user(
     let joined_games = games
         .iter()
         .map(|game: &store::Game| -> Result<JoinedGame, store::Error> {
-            let winners = store.read_users(&group_id, &game.winner_ids)?;
-            let losers = store.read_users(&group_id, &game.loser_ids)?;
+            let winners = store.read_users(&group_id, &game.clone().winner_ids())?;
+            let losers = store.read_users(&group_id, &game.clone().loser_ids())?;
             Ok(JoinedGame { winners, losers })
         })
         .collect::<Result<Vec<JoinedGame>, _>>()?;

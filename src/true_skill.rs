@@ -49,8 +49,9 @@ impl Message {
 /// Represents a player.
 #[derive(Serialize, Clone, Deserialize, Debug)]
 pub struct Player {
+    // TODO(mkiefel): remove visibility of members.
     /// Represents the combined belief of the skill of this player.
-    pub skill: Message,
+    pub skill: Message
 }
 
 impl Default for Player {
