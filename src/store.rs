@@ -558,17 +558,19 @@ impl Store {
     /// * `group_id` ID of the group.
     /// * `winner_ids` user IDs of winning users.
     /// * `loser_ids` user IDs of losing users.
+    /// * `datetime` when did the game take place.
     pub fn create_game(
         &mut self,
         group_id: &GroupId,
         winner_ids: &[UserId],
         loser_ids: &[UserId],
+        datetime: chrono::DateTime<chrono::Utc>,
     ) -> Result<Game, Error> {
         let game_id = GameId(uuid::Uuid::new_v4().simple().to_string());
         let key = Self::game_key(group_id, &game_id);
         let game = Game {
             id: game_id,
-            datetime: chrono::Utc::now(),
+            datetime,
             winner_ids: winner_ids.to_owned(),
             loser_ids: loser_ids.to_owned(),
         };

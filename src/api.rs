@@ -68,7 +68,12 @@ pub fn post_game(
 ) -> Result<Json<PostGameResponse>, Error> {
     let group_id = decode_and_validate_group_id(&group_key, secret_group_id)?;
     store
-        .create_game(&group_id, &request.winner_ids, &request.loser_ids)
+        .create_game(
+            &group_id,
+            &request.winner_ids,
+            &request.loser_ids,
+            chrono::Utc::now(),
+        )
         .map(|game| Json(PostGameResponse { game: game.into() }))
 }
 
