@@ -487,8 +487,12 @@ impl Store {
                 })
                 .unwrap_or(Ok(0))?;
 
-            con.zrevrange(Self::games_key(group_id), before_game_rank, 100)
-                .map_err(|err| err.into())
+            con.zrevrange(
+                Self::games_key(group_id),
+                before_game_rank,
+                before_game_rank + 99,
+            )
+            .map_err(|err| err.into())
         })?;
         // Games never will be deleted, so there is no race here.
         self.read_games(group_id, &game_ids)
