@@ -120,6 +120,10 @@ impl Game {
     pub fn id(&self) -> &GameId {
         &self.id
     }
+
+    pub fn datetime(&self) -> &chrono::DateTime<chrono::Utc> {
+        &self.datetime
+    }
 }
 
 quick_error! {

@@ -36,6 +36,7 @@ struct Game {
     id: GameId,
     winner_ids: Vec<UserId>,
     loser_ids: Vec<UserId>,
+    timestamp: u128,
 }
 
 impl From<skill_base::Game> for Game {
@@ -44,6 +45,7 @@ impl From<skill_base::Game> for Game {
             id: game.id().clone(),
             winner_ids: game.winner_ids().clone(),
             loser_ids: game.loser_ids().clone(),
+            timestamp: game.datetime().naive_utc().timestamp_millis() as u128,
         }
     }
 }
