@@ -2,29 +2,23 @@ use std::cmp::PartialOrd;
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 
+use async_trait::async_trait;
 use derive_more::From;
-use redis::{self, Commands, PipelineCommands};
-use transaction::Transaction;
+use quick_error::quick_error;
+use rocket::form::FromForm;
+use rocket::serde::{Deserialize, Serialize};
+use rocket_db_pools::deadpool_redis::{
+    redis::{self, AsyncCommands},
+    Connection,
+};
 
 use crate::merge;
 use crate::player::Player;
 use crate::true_skill::{GameResult, TrueSkill};
 
-pub struct Connection(redis::Connection);
-
-impl Connection {
-    pub fn new(con: redis::Connection) -> Self {
-        Connection(con)
-    }
-
-    pub fn con(&mut self) -> &mut redis::Connection {
-        &mut self.0
-    }
-}
-
 #[derive(Clone)]
 pub struct GroupId(String);
-#[derive(Clone, Debug, From, Serialize, Deserialize)]
+#[derive(Clone, From, Debug, Serialize, Deserialize, FromForm)]
 pub struct GameId(String);
 #[derive(Clone, Debug, PartialEq, Eq, From, Serialize, Deserialize, Hash)]
 pub struct UserId(String);
@@ -62,7 +56,36 @@ impl GroupKey {
     pub fn new(encoded: String) -> Option<Self> {
         base64::decode(&encoded)
             .ok()
-            .map(|bytes| GroupKey(cookie::Key::from_master(&bytes)))
+            .map(|bytes| GroupKey(cookie::Key::derive_from(&bytes)))
+    }
+}
+
+struct GroupKeyVisitor;
+
+impl<'de> serde::de::Visitor<'de> for GroupKeyVisitor {
+    type Value = GroupKey;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a cookie secret")
+    }
+
+    fn visit_str<E>(self, s: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        GroupKey::new(s.to_owned()).ok_or(serde::de::Error::invalid_value(
+            serde::de::Unexpected::Str(s),
+            &self,
+        ))
+    }
+}
+
+impl<'de> serde::de::Deserialize<'de> for GroupKey {
+    fn deserialize<D>(deserializer: D) -> Result<GroupKey, D::Error>
+    where
+        D: serde::de::Deserializer<'de>,
+    {
+        deserializer.deserialize_str(GroupKeyVisitor)
     }
 }
 
@@ -77,6 +100,23 @@ pub fn decode_and_validate_group_id(
         .get("group_id")
         .map(|cookie| GroupId(cookie.value().to_owned()))
         .ok_or(Error::InvalidGroupId)
+}
+
+quick_error! {
+    #[derive(Debug)]
+    pub enum Error {
+        Redis(err: redis::RedisError) {
+            cause(err)
+                from()
+        }
+        Merge(err: merge::Error<UserId>) {
+            cause(err)
+                from()
+        }
+        UserAlreadyExists {}
+        UserNameTooShort {}
+        InvalidGroupId {}
+    }
 }
 
 #[derive(Serialize, Clone, Deserialize, Debug)]
@@ -123,23 +163,6 @@ impl Game {
 
     pub fn datetime(&self) -> &chrono::DateTime<chrono::Utc> {
         &self.datetime
-    }
-}
-
-quick_error! {
-    #[derive(Debug)]
-    pub enum Error {
-        Redis(err: redis::RedisError) {
-            cause(err)
-                from()
-        }
-        Merge(err: merge::Error<UserId>) {
-            cause(err)
-                from()
-        }
-        UserAlreadyExists {}
-        UserNameTooShort {}
-        InvalidGroupId {}
     }
 }
 
@@ -196,7 +219,7 @@ impl<T> DerefMut for RedisJson<T> {
 
 struct UserStoreCtx<'a, C>
 where
-    C: redis::ConnectionLike,
+    C: redis::aio::ConnectionLike,
 {
     con: &'a mut C,
     group_id: GroupId,
@@ -205,7 +228,7 @@ where
 
 impl<'a, C> UserStoreCtx<'a, C>
 where
-    C: redis::ConnectionLike,
+    C: redis::aio::ConnectionLike,
 {
     fn append(&self, pipe: &mut redis::Pipeline) {
         for (k, v) in self.cache.iter() {
@@ -214,14 +237,15 @@ where
     }
 }
 
+#[async_trait]
 impl<'a, C> merge::MergeCtx for UserStoreCtx<'a, C>
 where
-    C: redis::ConnectionLike,
+    C: redis::aio::ConnectionLike + std::marker::Send,
 {
     type Index = UserId;
     type Item = User;
 
-    fn get_node(
+    async fn get_node(
         &mut self,
         index: &Self::Index,
     ) -> Option<merge::Mergeable<Self::Index, Self::Item>> {
@@ -232,9 +256,16 @@ where
         // Up to this point we have never encountered this node, let's fetch it
         // then from the store.
         let user_key = user_key(&self.group_id, index);
-        redis::cmd("WATCH").arg(&user_key).query(self.con).ok()?;
+
+        redis::cmd("WATCH")
+            .arg(&user_key)
+            .query_async(self.con)
+            .await
+            .ok()?;
+
         self.con
             .get(&user_key)
+            .await
             .map(
                 |RedisJson::<merge::Mergeable<Self::Index, Self::Item>>(node)| {
                     // Insert into cache for the next lookup.
@@ -245,7 +276,11 @@ where
             .ok()
     }
 
-    fn set_node(&mut self, index: &Self::Index, item: merge::Mergeable<Self::Index, Self::Item>) {
+    async fn set_node(
+        &mut self,
+        index: &Self::Index,
+        item: merge::Mergeable<Self::Index, Self::Item>,
+    ) {
         // The value is just set in the cache. Only when the transaction is
         // committed, it will be written to the store.
         self.cache.insert(index.clone(), item);
@@ -259,35 +294,46 @@ where
 ///
 /// * `con` the Redis connection.
 /// * `f` the transaction to commit.
-fn commit<C, F, R, E>(con: &mut C, f: F) -> Result<R, Error>
-where
-    C: redis::ConnectionLike,
-    F: Fn(&mut C, &mut redis::Pipeline) -> Result<R, E>,
-    E: std::convert::Into<Error>,
-{
-    loop {
-        let mut pipe = redis::pipe();
-        pipe.atomic();
-        let r = f(con, &mut pipe).map_err(|err| err.into())?;
-        if let Some(()) = pipe.query(con)? {
-            return Ok(r);
-        }
-        // Commit was not successful so try again.
-    }
+macro_rules! commit {
+    ($con:expr, $pipe_name:ident, $body:expr) => {{
+        let return_value: Result<_, Error> = loop {
+            let mut $pipe_name = redis::pipe();
+            $pipe_name.atomic();
+
+            // Return early if there was something strange while building up the transaction.
+            let result: Result<_, Error> = async { $body }.await;
+            if let Err(_) = result {
+                break result;
+            }
+
+            // Wait for the transaction to finish.
+            let transaction: Option<()> = $pipe_name.query_async($con).await?;
+
+            if let Some(()) = transaction {
+                // The transaction finish successfully. Let's return the result from the above
+                // body. This assumes that we are not interested in the result of the trnasaction
+                // itsself as it's meant to only write information.
+                break result;
+            }
+        };
+        return_value
+    }};
 }
 
-fn query_user_index(
+async fn query_user_index(
     con: &mut Connection,
     group_id: &GroupId,
     query: &str,
 ) -> Result<Vec<UserId>, Error> {
-    let entries: Vec<String> = con.0.zrangebylex_limit(
-        user_name_index_key(group_id),
-        "[".to_owned() + query,
-        "[".to_owned() + query + std::str::from_utf8(&[0x7f_u8]).unwrap(),
-        0,
-        10,
-    )?;
+    let entries: Vec<String> = con
+        .zrangebylex_limit(
+            user_name_index_key(group_id),
+            "[".to_owned() + query,
+            "[".to_owned() + query + std::str::from_utf8(&[0x7f_u8]).unwrap(),
+            0,
+            10,
+        )
+        .await?;
 
     let mut user_ids = Vec::new();
     for entry in entries {
@@ -300,23 +346,24 @@ fn query_user_index(
 }
 
 /// Reads all users given by a vector of user IDs.
-pub fn read_users(
+pub async fn read_users(
     con: &mut Connection,
     group_id: &GroupId,
     user_ids: &[UserId],
 ) -> Result<Vec<User>, Error> {
-    commit(&mut con.0, |con, pipe| {
+    commit!(&mut *con, pipe, {
         let mut ctx = UserStoreCtx {
             con,
             group_id: group_id.clone(),
             cache: HashMap::new(),
         };
-        let users = user_ids
-            .iter()
-            .map(|user_id| merge::find(user_id.clone()).run(&mut ctx))
-            .collect::<Result<Vec<User>, _>>();
-        ctx.append(pipe);
-        users
+        let mut users = Vec::new();
+        for user_id in user_ids {
+            users.push(merge::find(&mut ctx, user_id.clone()).await?);
+        }
+
+        ctx.append(&mut pipe);
+        Ok(users)
     })
 }
 
@@ -329,7 +376,7 @@ pub fn read_users(
 /// * `group_id` user will belong to this group.
 /// * `user_id` user will have this ID.
 /// * `name` of the user.
-pub fn create_user(
+pub async fn create_user(
     con: &mut Connection,
     group_id: &GroupId,
     user_id: &UserId,
@@ -342,16 +389,18 @@ pub fn create_user(
     let index_entry = name.to_owned() + ":" + &user_id.0;
 
     let user_name_index = user_name_index_key(group_id);
-    commit(&mut con.0, |con, pipe| {
+    commit!(&mut *con, pipe, {
         // Verify that the user does yet exist.
-        redis::cmd("WATCH").arg(&key).query(con)?;
-        let entries: Vec<String> = con.zrangebylex_limit(
-            &user_name_index,
-            "[".to_owned() + name + ":",
-            "[".to_owned() + name + ":" + std::str::from_utf8(&[0x7f_u8]).unwrap(),
-            0,
-            1,
-        )?;
+        redis::cmd("WATCH").arg(&key).query_async(con).await?;
+        let entries: Vec<String> = con
+            .zrangebylex_limit(
+                &user_name_index,
+                "[".to_owned() + name + ":",
+                "[".to_owned() + name + ":" + std::str::from_utf8(&[0x7f_u8]).unwrap(),
+                0,
+                1,
+            )
+            .await?;
         if !entries.is_empty() {
             return Err(Error::UserAlreadyExists);
         }
@@ -369,46 +418,47 @@ pub fn create_user(
             .zadd(&user_name_index, index_entry.clone(), 0_f32)
             .ignore()
             .sadd(user_id_key(group_id), &user_id.0)
-            .ignore()
-            .query(con)?;
+            .ignore();
         Ok(user)
     })
 }
 
 /// Reads the last 100 games from a user.
-pub fn get_recent_games(
+pub async fn get_recent_games(
     con: &mut Connection,
     group_id: &GroupId,
     user_id: &UserId,
 ) -> Result<Vec<Game>, Error> {
     // TODO(mkiefel): Implement some form of pagination for this.
-    let game_ids: Vec<GameId> = con.0.zrevrange(user_games_key(group_id, user_id), 0, 100)?;
+    let game_ids: Vec<GameId> = con
+        .zrevrange(user_games_key(group_id, user_id), 0, 100)
+        .await?;
     // Games never will be deleted, so there is no race here.
-    read_games(con, group_id, &game_ids)
+    read_games(con, group_id, &game_ids).await
 }
 
 /// Finds users whose name match the query.
-pub fn query_user(
+pub async fn query_user(
     con: &mut Connection,
     group_id: &GroupId,
     query: &str,
 ) -> Result<Vec<User>, Error> {
     // TODO(mkiefel): Implement some form of pagination for this.
-    let user_ids = query_user_index(con, group_id, query)?;
+    let user_ids = query_user_index(con, group_id, query).await?;
     // Users never will be deleted, so there is no race here.
-    read_users(con, group_id, &user_ids)
+    read_users(con, group_id, &user_ids).await
 }
 
 /// Reads the top 100 users.
-pub fn get_leaderboard(
+pub async fn get_leaderboard(
     con: &mut Connection,
     group_id: &GroupId,
     datetime: &chrono::DateTime<chrono::Utc>,
 ) -> Result<Vec<User>, Error> {
     // TODO(mkiefel): Implement some form of pagination for this.
-    let user_ids: Vec<UserId> = con.0.smembers(user_id_key(group_id))?;
+    let user_ids: Vec<UserId> = con.smembers(user_id_key(group_id)).await?;
     // Users never will be deleted, so there is no race here.
-    let mut users = read_users(con, &group_id, &user_ids)?;
+    let mut users = read_users(con, &group_id, &user_ids).await?;
     users.sort_unstable_by(|user_a, user_b| {
         let score_a = -map_score(user_a, datetime);
         let score_b = -map_score(user_b, datetime);
@@ -418,20 +468,22 @@ pub fn get_leaderboard(
 }
 
 /// Reads all games given by the vector of game IDs.
-pub fn read_games(
+pub async fn read_games(
     con: &mut Connection,
     group_id: &GroupId,
     game_ids: &[GameId],
 ) -> Result<Vec<Game>, Error> {
-    game_ids
-        .iter()
-        .map(|game_id| {
-            con.0
-                .get(game_key(group_id, &game_id))
-                .map(|RedisJson::<Game>(game)| game)
-        })
-        .collect::<Result<_, _>>()
-        .map_err(|err| err.into())
+    Ok(con
+        .get::<Vec<String>, Vec<RedisJson<Game>>>(
+            game_ids
+                .iter()
+                .map(|game_id| game_key(group_id, &game_id))
+                .collect::<Vec<_>>(),
+        )
+        .await?
+        .into_iter()
+        .map(|RedisJson::<Game>(game)| game)
+        .collect())
 }
 
 /// List all games.
@@ -440,31 +492,32 @@ pub fn read_games(
 ///
 /// * `group_id` ID of the group.
 /// * `before_game_id` start listing games before this optional game ID.
-pub fn list_games(
+pub async fn list_games(
     con: &mut Connection,
     group_id: &GroupId,
     before_game_id: &Option<GameId>,
 ) -> Result<Vec<Game>, Error> {
     let games_key = games_key(group_id);
-    let game_ids = commit(&mut con.0, |con, _pipe| -> Result<Vec<GameId>, Error> {
-        let before_game_rank = before_game_id
-            .as_ref()
-            .map(|game_id| -> Result<isize, Error> {
-                let (rank,): (isize,) = redis::pipe()
-                    .cmd("WATCH")
-                    .arg(&games_key)
-                    .ignore()
-                    .zrevrank(&games_key, game_id.0.clone())
-                    .query(con)?;
-                Ok(rank + 1)
-            })
-            .unwrap_or(Ok(0))?;
+    let game_ids: Vec<GameId> = commit!(&mut *con, pipe, {
+        let before_game_rank = if let Some(game_id) = before_game_id {
+            let (_, rank): ((), isize) = redis::pipe()
+                .cmd("WATCH")
+                .arg(&games_key)
+                .ignore()
+                .zrevrank(&games_key, game_id.0.clone())
+                .query_async(con)
+                .await?;
+            rank + 1
+        } else {
+            0
+        };
 
         con.zrevrange(&games_key, before_game_rank, before_game_rank + 99)
+            .await
             .map_err(|err| err.into())
     })?;
     // Games never will be deleted, so there is no race here.
-    read_games(con, group_id, &game_ids)
+    read_games(con, group_id, &game_ids).await
 }
 
 /// Create a game and update all involved player scores.
@@ -478,7 +531,7 @@ pub fn list_games(
 /// * `winner_ids` user IDs of winning users.
 /// * `loser_ids` user IDs of losing users.
 /// * `datetime` when did the game take place.
-pub fn create_game(
+pub async fn create_game(
     con: &mut Connection,
     group_id: &GroupId,
     game_id: &GameId,
@@ -496,71 +549,71 @@ pub fn create_game(
 
     let timestamp_key = format!("{}", game.datetime.naive_utc().timestamp_millis());
 
-    commit(
-        &mut con.0,
-        |con, pipe| -> Result<(), merge::Error<UserId>> {
-            // TODO(mkiefel): Remove some of the code duplication in this
-            // lambda.
-            let mut ctx = UserStoreCtx {
-                con,
-                group_id: group_id.clone(),
-                cache: HashMap::new(),
-            };
-            let mut winners = winner_ids
-                .iter()
-                .map(|user_id| merge::find(user_id.clone()).run(&mut ctx))
-                .collect::<Result<Vec<User>, _>>()?;
-            let mut losers = loser_ids
-                .iter()
-                .map(|user_id| merge::find(user_id.clone()).run(&mut ctx))
-                .collect::<Result<Vec<User>, _>>()?;
+    commit!(&mut *con, pipe, {
+        // TODO(mkiefel): a lot of the users can be fetched in parallel.
+        let mut ctx = UserStoreCtx {
+            con,
+            group_id: group_id.clone(),
+            cache: HashMap::new(),
+        };
+        // Get user stats.
+        let mut winners = Vec::new();
+        for winner_id in winner_ids {
+            winners.push(merge::find(&mut ctx, winner_id.clone()).await?);
+        }
+        let mut losers = Vec::new();
+        for loser_id in loser_ids {
+            losers.push(merge::find(&mut ctx, loser_id.clone()).await?);
+        }
 
-            let true_skill = TrueSkill::new(Player::default_sigma() / 2.0, 0.0);
-            let (winner_updates, loser_updates) = true_skill.tree_pass(
-                &winners
-                    .iter()
-                    .map(|user| user.player.skill_at(&datetime).unwrap())
-                    .collect::<Vec<_>>(),
-                &losers
-                    .iter()
-                    .map(|user| user.player.skill_at(&datetime).unwrap())
-                    .collect::<Vec<_>>(),
-                GameResult::Won,
+        // Reason about skills.
+        let true_skill = TrueSkill::new(Player::default_sigma() / 2.0, 0.0);
+        let (winner_updates, loser_updates) = true_skill.tree_pass(
+            &winners
+                .iter()
+                .map(|user| user.player.skill_at(&datetime).unwrap())
+                .collect::<Vec<_>>(),
+            &losers
+                .iter()
+                .map(|user| user.player.skill_at(&datetime).unwrap())
+                .collect::<Vec<_>>(),
+            GameResult::Won,
+        );
+
+        // Update user stats.
+        for (winner, update) in winners.iter_mut().zip(winner_updates) {
+            winner.player.set_skill(
+                winner.player.skill_at(&datetime).unwrap().include(&update),
+                datetime,
             );
-            for (winner, update) in winners.iter_mut().zip(winner_updates) {
-                winner.player.set_skill(
-                    winner.player.skill_at(&datetime).unwrap().include(&update),
-                    datetime,
-                );
-                merge::set(winner.id.clone(), winner.clone()).run(&mut ctx)?;
-                pipe.zadd(
-                    user_games_key(group_id, &winner.id),
-                    &game.id.0,
-                    &timestamp_key,
-                );
-            }
-            for (loser, update) in losers.iter_mut().zip(loser_updates) {
-                loser.player.set_skill(
-                    loser.player.skill_at(&datetime).unwrap().include(&update),
-                    datetime,
-                );
-                merge::set(loser.id.clone(), loser.clone()).run(&mut ctx)?;
-                pipe.zadd(
-                    user_games_key(group_id, &loser.id),
-                    &game.id.0,
-                    &timestamp_key,
-                );
-            }
-
-            ctx.append(pipe);
-            pipe.set(&key, RedisJson(game.clone())).zadd(
-                games_key(group_id),
+            merge::set(&mut ctx, winner.id.clone(), winner.clone()).await?;
+            pipe.zadd(
+                user_games_key(group_id, &winner.id),
                 &game.id.0,
                 &timestamp_key,
             );
-            Ok(())
-        },
-    )?;
+        }
+        for (loser, update) in losers.iter_mut().zip(loser_updates) {
+            loser.player.set_skill(
+                loser.player.skill_at(&datetime).unwrap().include(&update),
+                datetime,
+            );
+            merge::set(&mut ctx, loser.id.clone(), loser.clone()).await?;
+            pipe.zadd(
+                user_games_key(group_id, &loser.id),
+                &game.id.0,
+                &timestamp_key,
+            );
+        }
+
+        ctx.append(&mut pipe);
+        pipe.set(&key, RedisJson(game.clone())).zadd(
+            games_key(group_id),
+            &game.id.0,
+            &timestamp_key,
+        );
+        Ok(())
+    })?;
     Ok(game)
 }
 

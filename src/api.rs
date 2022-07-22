@@ -1,7 +1,13 @@
-use rocket::http::Status;
-use rocket::request::Request;
-use rocket::response::{self, Responder};
-use rocket_contrib::json::Json;
+use rocket::{
+    get,
+    http::Status,
+    post,
+    request::Request,
+    response::{self, Responder},
+    serde::{json::Json, Deserialize, Serialize},
+    State,
+};
+use rocket_db_pools::Connection;
 
 use crate::merge;
 use crate::message::Message;
@@ -9,18 +15,15 @@ use crate::skill_base::{self, decode_and_validate_group_id, Error, GameId, Group
 use crate::store::Store;
 
 impl<'r> rocket::request::FromParam<'r> for UserId {
-    type Error = &'r rocket::http::RawStr;
+    type Error = &'r str;
 
-    fn from_param(param: &'r rocket::http::RawStr) -> Result<Self, Self::Error> {
-        param
-            .percent_decode()
-            .map(|cow| cow.into_owned().into())
-            .map_err(|_| param)
+    fn from_param(param: &'r str) -> Result<Self, Self::Error> {
+        Ok(UserId::from(param.to_string()))
     }
 }
 
-impl<'r> Responder<'r> for Error {
-    fn respond_to(self, _: &Request) -> response::Result<'r> {
+impl<'r> Responder<'r, 'static> for Error {
+    fn respond_to(self, _: &'r Request<'_>) -> response::Result<'static> {
         match self {
             Error::UserAlreadyExists => Err(Status::Conflict),
             Error::UserNameTooShort => Err(Status::BadRequest),
@@ -74,17 +77,6 @@ impl From<skill_base::User> for User {
     }
 }
 
-impl<'a> rocket::request::FromFormValue<'a> for GameId {
-    type Error = &'a rocket::http::RawStr;
-
-    fn from_form_value(form_value: &'a rocket::http::RawStr) -> Result<Self, Self::Error> {
-        form_value
-            .url_decode()
-            .map(Into::<GameId>::into)
-            .map_err(|_| form_value)
-    }
-}
-
 #[derive(Deserialize, Debug)]
 pub struct PostGameRequest {
     winner_ids: Vec<UserId>,
@@ -96,14 +88,19 @@ pub struct PostGameResponse {
     game: Game,
 }
 
+#[derive(Deserialize)]
+pub struct GroupKeyConfig {
+    pub group_key: skill_base::GroupKey,
+}
+
 #[post("/<secret_group_id>/games", data = "<request>")]
-pub fn post_game(
-    mut store: Store,
-    group_key: rocket::State<GroupKey>,
+pub async fn post_game(
+    mut store: Connection<Store>,
+    group_key_config: &State<GroupKeyConfig>,
     secret_group_id: String,
     request: Json<PostGameRequest>,
 ) -> Result<Json<PostGameResponse>, Error> {
-    let group_id = decode_and_validate_group_id(&group_key, secret_group_id)?;
+    let group_id = decode_and_validate_group_id(&group_key_config.group_key, secret_group_id)?;
     let game_id = GameId::from(uuid::Uuid::new_v4().simple().to_string());
     skill_base::create_game(
         &mut store,
@@ -113,6 +110,7 @@ pub fn post_game(
         &request.loser_ids,
         chrono::Utc::now(),
     )
+    .await
     .map(|game| Json(PostGameResponse { game: game.into() }))
 }
 
@@ -122,18 +120,20 @@ pub struct GetGamesResponse {
 }
 
 #[get("/<secret_group_id>/games?<before>")]
-pub fn get_games(
-    mut store: Store,
-    group_key: rocket::State<GroupKey>,
+pub async fn get_games(
+    mut store: Connection<Store>,
+    group_key_config: &State<GroupKeyConfig>,
     secret_group_id: String,
     before: Option<GameId>,
 ) -> Result<Json<GetGamesResponse>, Error> {
-    let group_id = decode_and_validate_group_id(&group_key, secret_group_id)?;
-    skill_base::list_games(&mut store, &group_id, &before).map(|games| {
-        Json(GetGamesResponse {
-            games: games.into_iter().map(Game::from).collect(),
+    let group_id = decode_and_validate_group_id(&group_key_config.group_key, secret_group_id)?;
+    skill_base::list_games(&mut store, &group_id, &before)
+        .await
+        .map(|games| {
+            Json(GetGamesResponse {
+                games: games.into_iter().map(Game::from).collect(),
+            })
         })
-    })
 }
 
 #[derive(Deserialize, Debug)]
@@ -147,15 +147,16 @@ pub struct PostUserResponse {
 }
 
 #[post("/<secret_group_id>/users", data = "<request>")]
-pub fn post_user(
-    mut store: Store,
-    group_key: rocket::State<GroupKey>,
+pub async fn post_user(
+    mut store: Connection<Store>,
+    group_key_config: &State<GroupKeyConfig>,
     secret_group_id: String,
     request: Json<PostUserRequest>,
 ) -> Result<Json<PostUserResponse>, Error> {
-    let group_id = decode_and_validate_group_id(&group_key, secret_group_id)?;
+    let group_id = decode_and_validate_group_id(&group_key_config.group_key, secret_group_id)?;
     let user_id = UserId::from(uuid::Uuid::new_v4().simple().to_string());
     skill_base::create_user(&mut store, &group_id, &user_id, &request.name)
+        .await
         .map(|user| Json(PostUserResponse { user: user.into() }))
 }
 
@@ -165,17 +166,19 @@ pub struct GetUserResponse {
 }
 
 #[get("/<secret_group_id>/users/<user_id>")]
-pub fn get_user(
-    mut store: Store,
-    group_key: rocket::State<GroupKey>,
+pub async fn get_user(
+    mut store: Connection<Store>,
+    group_key_config: &State<GroupKeyConfig>,
     secret_group_id: String,
     user_id: UserId,
 ) -> Result<Json<GetUserResponse>, Error> {
-    let group_id = decode_and_validate_group_id(&group_key, secret_group_id)?;
-    skill_base::read_users(&mut store, &group_id, &[user_id]).map(|mut users| {
-        let user = users.pop().unwrap();
-        Json(GetUserResponse { user: user.into() })
-    })
+    let group_id = decode_and_validate_group_id(&group_key_config.group_key, secret_group_id)?;
+    skill_base::read_users(&mut store, &group_id, &[user_id])
+        .await
+        .map(|mut users| {
+            let user = users.pop().unwrap();
+            Json(GetUserResponse { user: user.into() })
+        })
 }
 
 #[derive(Serialize, Debug)]
@@ -185,19 +188,21 @@ pub struct QueryUserResponse {
 }
 
 #[get("/<secret_group_id>/users?<query>")]
-pub fn query_user(
-    mut store: Store,
-    group_key: rocket::State<GroupKey>,
+pub async fn query_user(
+    mut store: Connection<Store>,
+    group_key_config: &State<GroupKeyConfig>,
     secret_group_id: String,
     query: String,
 ) -> Result<Json<QueryUserResponse>, Error> {
-    let group_id = decode_and_validate_group_id(&group_key, secret_group_id)?;
-    skill_base::query_user(&mut store, &group_id, &query).map(|users| {
-        Json(QueryUserResponse {
-            query,
-            users: users.into_iter().map(User::from).collect(),
+    let group_id = decode_and_validate_group_id(&group_key_config.group_key, secret_group_id)?;
+    skill_base::query_user(&mut store, &group_id, &query)
+        .await
+        .map(|users| {
+            Json(QueryUserResponse {
+                query,
+                users: users.into_iter().map(User::from).collect(),
+            })
         })
-    })
 }
 
 #[derive(Serialize, Debug)]
@@ -206,15 +211,17 @@ pub struct GetLeaderboardResponse {
 }
 
 #[get("/<secret_group_id>/leaderboard")]
-pub fn get_leaderboard(
-    mut store: Store,
-    group_key: rocket::State<GroupKey>,
+pub async fn get_leaderboard(
+    mut store: Connection<Store>,
+    group_key_config: &State<GroupKeyConfig>,
     secret_group_id: String,
 ) -> Result<Json<GetLeaderboardResponse>, Error> {
-    let group_id = decode_and_validate_group_id(&group_key, secret_group_id)?;
-    skill_base::get_leaderboard(&mut store, &group_id, &chrono::Utc::now()).map(|users| {
-        Json(GetLeaderboardResponse {
-            users: users.into_iter().map(User::from).collect(),
+    let group_id = decode_and_validate_group_id(&group_key_config.group_key, secret_group_id)?;
+    skill_base::get_leaderboard(&mut store, &group_id, &chrono::Utc::now())
+        .await
+        .map(|users| {
+            Json(GetLeaderboardResponse {
+                users: users.into_iter().map(User::from).collect(),
+            })
         })
-    })
 }

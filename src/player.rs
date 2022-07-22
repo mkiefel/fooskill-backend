@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 use crate::message::Message;
 
 /// Represents a player.

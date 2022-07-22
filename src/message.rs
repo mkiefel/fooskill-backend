@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 /// Gaussian message.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 pub struct Message {

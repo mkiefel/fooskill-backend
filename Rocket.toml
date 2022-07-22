@@ -1,6 +1,6 @@
-[global.databases]
-fooskill = { url = "redis://localhost" }
+[default.databases.fooskill]
+url = "redis://localhost"
 
-[development]
+[default]
 template_dir = "frontend/templates/"
 group_key = "jXCShrqu7CmSG+qHZ5nWfO8JfQWUIgEo/ZpsKyerv10="

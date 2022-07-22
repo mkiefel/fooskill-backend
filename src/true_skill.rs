@@ -23,10 +23,7 @@ impl TrueSkill {
     ///    skill.
     /// * `eps` draw margin around 0.
     pub fn new(beta: f64, eps: f64) -> Self {
-        TrueSkill {
-            beta,
-            eps,
-        }
+        TrueSkill { beta, eps }
     }
 
     fn pass_from_skill(&self, skill: &Message) -> Message {

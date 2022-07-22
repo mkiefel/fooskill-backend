@@ -1,14 +1,10 @@
-#![feature(proc_macro_hygiene, decl_macro)]
-
-#[macro_use]
-extern crate rocket;
-#[macro_use]
-extern crate serde_derive;
-
 use std::collections::HashMap;
 
-use rocket_contrib::serve::{Options, StaticFiles};
-use rocket_contrib::templates;
+use rocket::fs::FileServer;
+use rocket::{fairing::AdHoc, get, launch, routes};
+use rocket_db_pools::{Connection, Database};
+use rocket_dyn_templates::Template;
+use serde::Serialize;
 
 use fooskill::api;
 use fooskill::skill_base;
@@ -30,28 +26,28 @@ struct GetUserContext {
 }
 
 #[get("/<secret_group_id>/users/<user_id>")]
-fn user(
-    mut store: Store,
-    group_key: rocket::State<skill_base::GroupKey>,
+async fn user(
+    mut store: Connection<Store>,
+    group_key_config: &rocket::State<api::GroupKeyConfig>,
     secret_group_id: String,
     user_id: skill_base::UserId,
-) -> Result<templates::Template, skill_base::Error> {
-    let group_id = skill_base::decode_and_validate_group_id(&group_key, secret_group_id.clone())?;
-    let users = skill_base::read_users(&mut store, &group_id, &[user_id.clone()])?;
+) -> Result<Template, skill_base::Error> {
+    let group_id = skill_base::decode_and_validate_group_id(
+        &group_key_config.group_key,
+        secret_group_id.clone(),
+    )?;
+    let users = skill_base::read_users(&mut store, &group_id, &[user_id.clone()]).await?;
     let user = users.first().unwrap();
-    let games = skill_base::get_recent_games(&mut store, &group_id, &user_id)?;
-    let joined_games = games
-        .iter()
-        .map(
-            |game: &skill_base::Game| -> Result<JoinedGame, skill_base::Error> {
-                let winners =
-                    skill_base::read_users(&mut store, &group_id, &game.clone().winner_ids())?;
-                let losers =
-                    skill_base::read_users(&mut store, &group_id, &game.clone().loser_ids())?;
-                Ok(JoinedGame { winners, losers })
-            },
-        )
-        .collect::<Result<Vec<JoinedGame>, _>>()?;
+    let games = skill_base::get_recent_games(&mut store, &group_id, &user_id).await?;
+
+    let mut joined_games = Vec::new();
+    for game in games {
+        let winners =
+            skill_base::read_users(&mut store, &group_id, &game.clone().winner_ids()).await?;
+        let losers =
+            skill_base::read_users(&mut store, &group_id, &game.clone().loser_ids()).await?;
+        joined_games.push(JoinedGame { winners, losers });
+    }
     let context = GetUserContext {
         secret_group_id: percent_encoding::utf8_percent_encode(
             &secret_group_id,
@@ -61,23 +57,27 @@ fn user(
         user: user.clone(),
         games: joined_games,
     };
-    Ok(templates::Template::render("user", &context))
+    Ok(Template::render("user", &context))
 }
 
 #[get("/<_secret_group_id>")]
-fn group(_secret_group_id: String) -> templates::Template {
+fn group(_secret_group_id: String) -> Template {
     let context: HashMap<String, String> = HashMap::new();
-    templates::Template::render("index", context)
+    Template::render("index", context)
 }
 
 #[get("/")]
-fn index() -> templates::Template {
+fn index() -> Template {
     let context: HashMap<String, String> = HashMap::new();
-    templates::Template::render("index", context)
+    Template::render("index", context)
 }
 
-fn main() {
-    rocket::ignite()
+#[launch]
+fn rocket() -> _ {
+    rocket::build()
+        .attach(AdHoc::config::<api::GroupKeyConfig>())
+        .attach(Store::init())
+        .attach(Template::fairing())
         .mount(
             "/api/v1.0/",
             routes![
@@ -90,26 +90,5 @@ fn main() {
             ],
         )
         .mount("/", routes![index, group, user])
-        .mount(
-            "/static",
-            StaticFiles::new("frontend/static", Options::None),
-        )
-        .attach(rocket::fairing::AdHoc::on_attach(
-            "Group Key Config",
-            |rocket| {
-                let maybe_key = rocket
-                    .config()
-                    .get_str("group_key")
-                    .ok()
-                    .and_then(|key| skill_base::GroupKey::new(key.to_owned()));
-
-                match maybe_key {
-                    Some(key) => Ok(rocket.manage(key)),
-                    None => Ok(rocket),
-                }
-            },
-        ))
-        .attach(Store::fairing())
-        .attach(templates::Template::fairing())
-        .launch();
+        .mount("/static", FileServer::from("frontend/static"))
 }
