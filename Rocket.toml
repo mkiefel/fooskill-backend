@@ -4,3 +4,8 @@ url = "redis://localhost"
 [default]
 template_dir = "frontend/templates/"
 group_key = "jXCShrqu7CmSG+qHZ5nWfO8JfQWUIgEo/ZpsKyerv10="
+
+[release]
+address = "127.0.0.1"
+port = 8020
+log_level = "normal"
