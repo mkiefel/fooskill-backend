@@ -5,7 +5,6 @@ use crate::message::Message;
 /// Represents a player.
 #[derive(Serialize, Clone, Deserialize, Debug)]
 pub struct Player {
-    // TODO(mkiefel): remove visibility of members.
     /// Represents the combined belief of the skill of this player.
     skill: Message,
     /// The point in time when the above skill was estimated.
@@ -16,11 +15,7 @@ impl Default for Player {
     fn default() -> Self {
         Player {
             skill: Message::from_mu_sigma2(Player::default_mean(), Player::default_sigma().powi(2)),
-            // Not super ideal, but we just pick something really long ago.
-            datetime: chrono::DateTime::<chrono::Utc>::from_utc(
-                chrono::NaiveDateTime::from_timestamp(0, 0),
-                chrono::Utc,
-            ),
+            datetime: chrono::Utc::now(),
         }
     }
 }
@@ -33,13 +28,10 @@ impl Player {
         if time_delta < chrono::Duration::zero() {
             return None;
         }
-        let delta = (-(time_delta.num_milliseconds() as f64)
-            / (Self::default_length_scale().num_milliseconds() as f64))
-            .exp();
         let (mu, sigma2) = self.skill.to_mu_sigma2();
         Some(Message::from_mu_sigma2(
-            (mu - Self::default_mean()) * delta + Self::default_mean(),
-            Self::default_sigma().powi(2) * (1.0 - delta.powi(2)) + delta.powi(2) * sigma2,
+            mu,
+            sigma2 + Self::default_sigma2_change_speed() * (time_delta.num_seconds() as f64),
         ))
     }
 
@@ -56,7 +48,8 @@ impl Player {
         Player::default_mean() / 3.0
     }
 
-    fn default_length_scale() -> chrono::Duration {
-        chrono::Duration::days(90)
+    /// Speed at which sigma2 increases per second.
+    fn default_sigma2_change_speed() -> f64 {
+        20.0 / (chrono::Duration::days(90).num_seconds() as f64)
     }
 }
