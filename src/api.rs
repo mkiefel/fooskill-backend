@@ -11,7 +11,7 @@ use rocket_db_pools::Connection;
 
 use crate::merge;
 use crate::message::Message;
-use crate::skill_base::{self, decode_and_validate_group_id, Error, GameId, GroupKey, UserId};
+use crate::skill_base::{self, decode_and_validate_group_id, Error, GameId, UserId};
 use crate::store::Store;
 
 impl<'r> rocket::request::FromParam<'r> for UserId {
