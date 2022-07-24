@@ -25,7 +25,7 @@ struct GetUserContext {
     games: Vec<JoinedGame>,
 }
 
-#[get("/<secret_group_id>/users/<user_id>")]
+#[get("/g/<secret_group_id>/u/<user_id>")]
 async fn user(
     mut store: Connection<Store>,
     group_key_config: &rocket::State<api::GroupKeyConfig>,
@@ -60,7 +60,7 @@ async fn user(
     Ok(Template::render("user", &context))
 }
 
-#[get("/<_secret_group_id>")]
+#[get("/g/<_secret_group_id>")]
 fn group(_secret_group_id: String) -> Template {
     let context: HashMap<String, String> = HashMap::new();
     Template::render("index", context)
