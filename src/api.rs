@@ -29,7 +29,10 @@ impl<'r> Responder<'r, 'static> for Error {
             Error::UserNameTooShort => Err(Status::BadRequest),
             Error::Merge(merge::Error::MissingEntryError(_)) => Err(Status::NotFound),
             Error::InvalidGroupId => Err(Status::BadRequest),
-            _ => Err(Status::InternalServerError),
+            err => {
+                println!("{:?}", err);
+                Err(Status::InternalServerError)
+            }
         }
     }
 }
