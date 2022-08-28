@@ -473,13 +473,19 @@ pub async fn read_games(
     group_id: &GroupId,
     game_ids: &[GameId],
 ) -> Result<Vec<Game>, Error> {
-    Ok(con
-        .get::<Vec<String>, Vec<RedisJson<Game>>>(
+    // Get below does not like it if the list requested is empty.
+    if game_ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    Ok(redis::cmd("MGET")
+        .arg(
             game_ids
                 .iter()
                 .map(|game_id| game_key(group_id, &game_id))
                 .collect::<Vec<_>>(),
         )
+        .query_async::<_, Vec<RedisJson<Game>>>(con)
         .await?
         .into_iter()
         .map(|RedisJson::<Game>(game)| game)
