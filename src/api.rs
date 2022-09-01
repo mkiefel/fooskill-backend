@@ -80,6 +80,13 @@ impl From<skill_base::User> for User {
     }
 }
 
+fn into_users(users: Vec<skill_base::User>) -> Vec<User> {
+    users
+        .into_iter()
+        .map(|user| user.into())
+        .collect::<Vec<_>>()
+}
+
 #[derive(Deserialize, Debug)]
 pub struct PostGameRequest {
     winner_ids: Vec<UserId>,
@@ -182,6 +189,50 @@ pub async fn get_user(
             let user = users.pop().unwrap();
             Json(GetUserResponse { user: user.into() })
         })
+}
+
+/// Repesents a game with all players being resolved to their user data.
+#[derive(Serialize, Debug)]
+struct JoinedGame {
+    winners: Vec<User>,
+    losers: Vec<User>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct GetUserGamesResponse {
+    user: User,
+    games: Vec<JoinedGame>,
+}
+
+#[get("/<secret_group_id>/users/<user_id>/games")]
+pub async fn get_user_games(
+    mut store: Connection<Store>,
+    group_key_config: &State<GroupKeyConfig>,
+    secret_group_id: String,
+    user_id: UserId,
+) -> Result<Json<GetUserGamesResponse>, Error> {
+    let group_id =
+        decode_and_validate_group_id(&group_key_config.group_key, secret_group_id.clone())?;
+    let user = skill_base::read_users(&mut store, &group_id, &[user_id.clone()])
+        .await
+        .map(|mut users| users.pop().unwrap())?;
+    let games = skill_base::get_recent_games(&mut store, &group_id, &user_id).await?;
+
+    let mut joined_games = Vec::new();
+    for game in games {
+        let winners = into_users(
+            skill_base::read_users(&mut store, &group_id, &game.clone().winner_ids()).await?,
+        );
+        let losers = into_users(
+            skill_base::read_users(&mut store, &group_id, &game.clone().loser_ids()).await?,
+        );
+        joined_games.push(JoinedGame { winners, losers });
+    }
+
+    Ok(Json(GetUserGamesResponse {
+        user: user.into(),
+        games: joined_games,
+    }))
 }
 
 #[derive(Serialize, Debug)]
