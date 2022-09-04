@@ -1,6 +1,4 @@
-use std::path::PathBuf;
-
-use rocket::fs::{relative, FileServer, NamedFile};
+use rocket::fs::{FileServer, NamedFile};
 use rocket::{fairing::AdHoc, get, launch, routes};
 use rocket_db_pools::Database;
 
@@ -9,9 +7,7 @@ use fooskill::store::Store;
 
 #[get("/<_..>", rank = 100)]
 async fn index() -> Option<NamedFile> {
-    NamedFile::open(relative!("frontend/static/index.html"))
-        .await
-        .ok()
+    NamedFile::open("frontend/static/index.html").await.ok()
 }
 
 #[launch]
